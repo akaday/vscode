@@ -65,7 +65,7 @@ import { ITestProfileService, canUseProfileWithTest } from '../common/testProfil
 import { LiveTestResult, TestResultItemChangeReason } from '../common/testResult.js';
 import { ITestResultService } from '../common/testResultService.js';
 import { IMainThreadTestCollection, ITestService, testCollectionIsEmpty } from '../common/testService.js';
-import { ITestRunProfile, InternalTestItem, TestControllerCapability, TestItemExpandState, TestResultState, TestRunProfileBitset } from '../common/testTypes.js';
+import { ITestRunProfile, InternalTestItem, TestControllerCapability, TestItemExpandState, TestResultState, TestRunProfileBitset, testResultStateToContextValues } from '../common/testTypes.js';
 import { TestingContextKeys } from '../common/testingContextKeys.js';
 import { ITestingContinuousRunService } from '../common/testingContinuousRunService.js';
 import { ITestingPeekOpener } from '../common/testingPeekOpener.js';
@@ -772,7 +772,19 @@ class TestingExplorerViewModel extends Disposable {
 			filterState.text.onDidChange,
 			filterState.fuzzy.onDidChange,
 			testService.excluded.onTestExclusionsChanged,
-		)(this.tree.refilter, this.tree));
+		)(() => {
+			if (!filterState.text.value) {
+				return this.tree.refilter();
+			}
+
+			const items = this.filter.lastIncludedTests = new Set();
+			this.tree.refilter();
+			this.filter.lastIncludedTests = undefined;
+
+			for (const test of items) {
+				this.tree.expandTo(test);
+			}
+		}));
 
 		this._register(this.tree.onDidOpen(e => {
 			if (e.element instanceof TestItemTreeElement && !e.element.children.size && e.element.test.item.uri) {
@@ -1125,6 +1137,8 @@ const hasNodeInOrParentOfUri = (collection: IMainThreadTestCollection, ident: IU
 class TestsFilter implements ITreeFilter<TestExplorerTreeElement> {
 	private documentUris: URI[] = [];
 
+	public lastIncludedTests?: Set<TestExplorerTreeElement>;
+
 	constructor(
 		private readonly collection: IMainThreadTestCollection,
 		@ITestExplorerFilterState private readonly state: ITestExplorerFilterState,
@@ -1152,6 +1166,7 @@ class TestsFilter implements ITreeFilter<TestExplorerTreeElement> {
 			case FilterResult.Exclude:
 				return TreeVisibility.Hidden;
 			case FilterResult.Include:
+				this.lastIncludedTests?.add(element);
 				return TreeVisibility.Visible;
 			default:
 				return TreeVisibility.Recurse;
@@ -1500,14 +1515,14 @@ class TestItemRenderer extends Disposable
 	public renderElement(node: ITreeNode<TestItemTreeElement, FuzzyScore>, _depth: number, data: ITestElementTemplateData): void {
 		data.elementDisposable.clear();
 		data.current = node.element;
-		this.fillActionBar(node.element, data);
-
 
 		data.elementDisposable.add(node.element.onChange(() => this._renderElement(node, data)));
 		this._renderElement(node, data);
 	}
 
 	public _renderElement(node: ITreeNode<TestItemTreeElement, FuzzyScore>, data: ITestElementTemplateData): void {
+		this.fillActionBar(node.element, data);
+
 		const testHidden = this.testService.excluded.contains(node.element.test);
 		data.wrapper.classList.toggle('test-is-hidden', testHidden);
 
@@ -1583,6 +1598,12 @@ const getActionableElementActions = (
 		], [
 			TestingContextKeys.supportsContinuousRun.key,
 			supportsCr,
+		], [
+			TestingContextKeys.testResultOutdated.key,
+			element.retired,
+		], [
+			TestingContextKeys.testResultState.key,
+			testResultStateToContextValues[element.state],
 		]);
 	}
 

@@ -64,14 +64,15 @@ import { INotificationService } from '../../../../platform/notification/common/n
 import { IOpenerService, type OpenInternalOptions } from '../../../../platform/opener/common/opener.js';
 import { IThemeService } from '../../../../platform/theme/common/themeService.js';
 import { ResourceLabels } from '../../../browser/labels.js';
-import { IEditorService } from '../../../services/editor/common/editorService.js';
+import { ACTIVE_GROUP, IEditorService, SIDE_GROUP } from '../../../services/editor/common/editorService.js';
 import { AccessibilityVerbositySettingId } from '../../accessibility/browser/accessibilityConfiguration.js';
 import { AccessibilityCommandId } from '../../accessibility/common/accessibilityCommands.js';
 import { getSimpleCodeEditorWidgetOptions, getSimpleEditorOptions, setupSimpleEditorSelectionStyling } from '../../codeEditor/browser/simpleEditorOptions.js';
 import { ChatAgentLocation, IChatAgentService } from '../common/chatAgents.js';
-import { CONTEXT_CHAT_HAS_FILE_ATTACHMENTS, CONTEXT_CHAT_INPUT_CURSOR_AT_TOP, CONTEXT_CHAT_INPUT_HAS_FOCUS, CONTEXT_CHAT_INPUT_HAS_TEXT, CONTEXT_IN_CHAT_INPUT } from '../common/chatContextKeys.js';
+import { ChatContextKeys } from '../common/chatContextKeys.js';
 import { ChatEditingSessionState, IChatEditingService, IChatEditingSession, WorkingSetEntryState } from '../common/chatEditingService.js';
 import { IChatRequestVariableEntry } from '../common/chatModel.js';
+import { ChatRequestDynamicVariablePart } from '../common/chatParserTypes.js';
 import { IChatFollowup } from '../common/chatService.js';
 import { IChatResponseViewModel } from '../common/chatViewModel.js';
 import { IChatHistoryEntry, IChatInputState, IChatWidgetHistoryService } from '../common/chatWidgetHistoryService.js';
@@ -223,6 +224,15 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		}
 		return edits;
 	}
+
+	private _attemptedWorkingSetEntriesCount: number = 0;
+	/**
+	 * The number of working set entries that the user actually wanted to attach.
+	 * This is less than or equal to {@link ChatInputPart.chatEditWorkingSetFiles}.
+	 */
+	public get attemptedWorkingSetEntriesCount() {
+		return this._attemptedWorkingSetEntriesCount;
+	}
 	private _combinedChatEditWorkingSetEntries: URI[] = [];
 	public get chatEditWorkingSetFiles() {
 		return this._combinedChatEditWorkingSetEntries;
@@ -262,9 +272,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		};
 		this.inputEditorMaxHeight = this.options.renderStyle === 'compact' ? INPUT_EDITOR_MAX_HEIGHT / 3 : INPUT_EDITOR_MAX_HEIGHT;
 
-		this.inputEditorHasText = CONTEXT_CHAT_INPUT_HAS_TEXT.bindTo(contextKeyService);
-		this.chatCursorAtTop = CONTEXT_CHAT_INPUT_CURSOR_AT_TOP.bindTo(contextKeyService);
-		this.inputEditorHasFocus = CONTEXT_CHAT_INPUT_HAS_FOCUS.bindTo(contextKeyService);
+		this.inputEditorHasText = ChatContextKeys.inputHasText.bindTo(contextKeyService);
+		this.chatCursorAtTop = ChatContextKeys.inputCursorAtTop.bindTo(contextKeyService);
+		this.inputEditorHasFocus = ChatContextKeys.inputHasFocus.bindTo(contextKeyService);
 
 		this.history = this.loadHistory();
 		this._register(this.historyService.onDidClearHistory(() => this.history = new HistoryNavigator2([{ text: '' }], 50, historyKeyFn)));
@@ -277,7 +287,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 		this._chatEditsListPool = this._register(this.instantiationService.createInstance(CollapsibleListPool, this._onDidChangeVisibility.event, MenuId.ChatEditingWidgetModifiedFilesToolbar));
 
-		this._hasFileAttachmentContextKey = CONTEXT_CHAT_HAS_FILE_ATTACHMENTS.bindTo(contextKeyService);
+		this._hasFileAttachmentContextKey = ChatContextKeys.hasFileAttachments.bindTo(contextKeyService);
 	}
 
 	private setCurrentLanguageModelToDefault() {
@@ -538,7 +548,7 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		this.renderChatEditingSessionState(null, widget);
 
 		const inputScopedContextKeyService = this._register(this.contextKeyService.createScoped(inputContainer));
-		CONTEXT_IN_CHAT_INPUT.bindTo(inputScopedContextKeyService).set(true);
+		ChatContextKeys.inChatInput.bindTo(inputScopedContextKeyService).set(true);
 		const scopedInstantiationService = this._register(this.instantiationService.createChild(new ServiceCollection([IContextKeyService, inputScopedContextKeyService])));
 
 		const { historyNavigationBackwardsEnablement, historyNavigationForwardsEnablement } = this._register(registerAndCreateHistoryNavigationContext(inputScopedContextKeyService, this));
@@ -916,9 +926,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 		// Summary of number of files changed
 		const innerContainer = this.chatEditingSessionWidgetContainer.querySelector('.chat-editing-session-container.show-file-icons') as HTMLElement ?? dom.append(this.chatEditingSessionWidgetContainer, $('.chat-editing-session-container.show-file-icons'));
-		const modifiedFiles = new ResourceSet();
+		const seenEntries = new ResourceSet();
 		let entries: IChatCollapsibleListItem[] = chatEditingSession?.entries.get().map((entry) => {
-			modifiedFiles.add(entry.modifiedURI);
+			seenEntries.add(entry.modifiedURI);
 			return {
 				reference: entry.modifiedURI,
 				state: entry.state.get(),
@@ -926,20 +936,31 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 			};
 		}) ?? [];
 		for (const attachment of this.attachmentModel.attachments) {
-			if (attachment.isFile && URI.isUri(attachment.value) && !modifiedFiles.has(attachment.value)) {
+			if (attachment.isFile && URI.isUri(attachment.value) && !seenEntries.has(attachment.value)) {
 				entries.unshift({
 					reference: attachment.value,
 					state: WorkingSetEntryState.Attached,
 					kind: 'reference',
 				});
-				modifiedFiles.add(attachment.value);
+				seenEntries.add(attachment.value);
 			}
 		}
 		for (const [file, state] of chatEditingSession.workingSet.entries()) {
-			if (!modifiedFiles.has(file)) {
+			if (!seenEntries.has(file)) {
 				entries.unshift({
 					reference: file,
 					state: state,
+					kind: 'reference',
+				});
+				seenEntries.add(file);
+			}
+		}
+		// Factor file variables that are part of the user query into the working set
+		for (const part of chatWidget?.parsedInput.parts ?? []) {
+			if (part instanceof ChatRequestDynamicVariablePart && part.isFile && URI.isUri(part.data) && !seenEntries.has(part.data)) {
+				entries.unshift({
+					reference: part.data,
+					state: WorkingSetEntryState.Attached,
 					kind: 'reference',
 				});
 			}
@@ -957,6 +978,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 		const overviewRegion = innerContainer.querySelector('.chat-editing-session-overview') as HTMLElement ?? dom.append(innerContainer, $('.chat-editing-session-overview'));
 		const overviewText = overviewRegion.querySelector('span') ?? dom.append(overviewRegion, $('span'));
 		overviewText.textContent = localize('chatEditingSession.workingSet', 'Working Set');
+
+		// Record the number of entries that the user wanted to add to the working set
+		this._attemptedWorkingSetEntriesCount = entries.length;
 
 		if (entries.length === 1) {
 			overviewText.textContent += ' ' + localize('chatEditingSession.oneFile', '(1 file)');
@@ -993,6 +1017,9 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 
 		this._chatEditsActionsDisposables.add(this.instantiationService.createInstance(MenuWorkbenchButtonBar, actionsContainer, MenuId.ChatEditingWidgetToolbar, {
 			telemetrySource: this.options.menus.telemetrySource,
+			menuOptions: {
+				arg: { sessionId: chatEditingSession.chatSessionId },
+			},
 			buttonConfigProvider: (action) => {
 				if (action.id === ChatEditingShowChangesAction.ID || action.id === ChatEditingSaveAllAction.ID) {
 					return { showIcon: true, showLabel: false, isSecondary: true };
@@ -1026,7 +1053,13 @@ export class ChatInputPart extends Disposable implements IHistoryNavigationWidge
 					const diffInfo = entry?.diffInfo.get();
 					const range = diffInfo?.changes.at(0)?.modified.toExclusiveRange();
 
-					this.editorService.openEditor({ resource: modifiedFileUri, options: { selection: range, preserveFocus: true, revealIfOpened: true } });
+					this.editorService.openEditor({
+						resource: modifiedFileUri,
+						options: {
+							...e.editorOptions,
+							selection: range,
+						}
+					}, e.sideBySide ? SIDE_GROUP : ACTIVE_GROUP);
 				}
 			}));
 			this._chatEditsDisposables.add(addDisposableListener(list.getHTMLElement(), 'click', e => {
